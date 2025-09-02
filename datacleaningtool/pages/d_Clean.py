@@ -14,6 +14,8 @@ from datetime import datetime
 from typing import Optional, Tuple, Dict, Any, List, Callable
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
+load_dotenv()
 # ==================================
 # PAGE CONFIGURATION
 # ==================================
@@ -73,6 +75,7 @@ try:
         clean_data_types,
         standardize_values,
         normalize_dates,
+        convert_currency,
         CleaningSummary
     )
     from utils.shared import init_session_state, log_cleaning_step
@@ -267,9 +270,23 @@ def render_manual_cleaning_interface() -> None:
         missing_count = st.session_state.df[col_name].isnull().sum()
         return f"{col_name} ({missing_count} missing)" if missing_count > 0 else col_name
 
-    tab_dup, tab_miss, tab_std, tab_type, tab_rename, tab_dates = st.tabs(
-        ["Duplicates", "Missing Values", "Text Standardization", "Data Types", "Rename Columns", "Date Normalization"]
+    tab_analyze, tab_dup, tab_miss, tab_std, tab_dates, tab_currency, tab_type, tab_rename = st.tabs(
+        ["Data Analysis", "Duplicates", "Missing Values","Text Standardization", "Date Formats", "Currency Conversion", "Data Types", "Rename Columns"]
     )
+
+    # --- NEW: DEDICATED DATA ANALYSIS TAB ---
+    with tab_analyze:
+        st.subheader("Automated Data Quality Analysis")
+        st.info(
+            "Click the button below to generate a technical report of the current data quality. This action does not change your data.")
+
+        if st.button("Analyze Current Dataset", use_container_width=True):
+            try:
+                analysis_result = analyze_dataset(st.session_state.df)
+                st.json(analysis_result)
+            except Exception as e:
+                st.error("The analysis could not be completed.")
+                print(traceback.format_exc())
 
     # --- Duplicates ---
     with tab_dup:
@@ -334,66 +351,90 @@ def render_manual_cleaning_interface() -> None:
                                                   column_to_process=selected_cols,
                                                   fill_value=custom_val if selected_key == "custom" else None)
 
-    # --- Text Standardization ---
-    with tab_std:
-        st.subheader("Standardize Text Columns")
-        col1, col2 = st.columns(2)
+        # --- UPGRADED: Text Standardization Tab ---
+        with tab_std:
+            st.subheader("Standardize Text, Names & Codes")
 
-        with col1:
             text_cols = list(st.session_state.df.select_dtypes(include=['object', 'string']).columns)
             target_cols = st.multiselect("Columns to standardize:", options=text_cols, default=text_cols)
 
-        with col2:
-            st.write("**Standardization Options**")
-            strip_ws = st.toggle("Strip leading/trailing whitespace", value=True)
-            to_lower = st.toggle("Convert to lowercase")
-            to_upper = st.toggle("Convert to UPPERCASE", disabled=to_lower)
-            remove_punct = st.toggle("Remove punctuation ([.,!?;:])")
-            remove_digits = st.toggle("Remove digits (0-9)")
+            st.markdown("**Formatting Options**")
+            c1, c2 = st.columns(2)
+            with c1:
+                strip_ws = st.toggle("Strip whitespace", value=True, help="Remove spaces at the beginning and end.")
+                to_lower = st.toggle("Convert to lowercase")
+                remove_punct = st.toggle("Remove punctuation")
+            with c2:
+                # --- NEW: Added toggles for your new functions ---
+                apply_proper = st.toggle("Format Proper Names",
+                                         help="Converts 'whitney mac intosh' to 'Whitney Mac Intosh'.")
+                expand_abbr = st.toggle("Expand Country Codes",
+                                        help="Converts 'NL' to 'Netherlands', 'CUR' to 'Curaçao'.")
+                remove_digits = st.toggle("Remove digits")
 
-        if st.button("Standardize Text", key="standardize_text_btn", use_container_width=True, type="primary"):
-            if not target_cols:
-                st.warning("Please select columns to standardize.")
-            else:
-                chars_to_remove = ""
-                if remove_punct:
-                    chars_to_remove += r'[.,!?;:]'
-                if remove_digits:
-                    chars_to_remove += r'\d'
-                regex_to_remove = f"[{chars_to_remove}]" if chars_to_remove else None
+            if st.button("Standardize Text", key="standardize_text_btn", use_container_width=True, type="primary"):
+                if not target_cols:
+                    st.warning("Please select columns to standardize.")
+                else:
+                    regex_to_remove = ""
+                    if remove_punct: regex_to_remove += r'[.,!?;:]'
+                    if remove_digits: regex_to_remove += r'\d'
 
-                _apply_manual_cleaning_action("standardize_values", standardize_values, st.session_state.df,
-                                              "Standardize Text",
-                                              target_columns=target_cols,
-                                              text_to_lowercase=to_lower,
-                                              text_to_uppercase=to_upper,
-                                              strip_whitespace_all=strip_ws,
-                                              remove_chars_regex=regex_to_remove)
+                    # We call the same standardize_values function, which now accepts the new parameters
+                    _apply_manual_cleaning_action(
+                        "standardize_values",
+                        standardize_values,
+                        st.session_state.df,
+                        "Standardize Text",
+                        target_columns=target_cols,
+                        text_to_lowercase=to_lower,
+                        strip_whitespace_all=strip_ws,
+                        apply_proper_case=apply_proper,  # Pass the new flag
+                        expand_countries=expand_abbr,  # Pass the new flag
+                        remove_chars_regex=f"[{regex_to_remove}]" if regex_to_remove else None
+                    )
 
     # --- Date Normalization ---
     with tab_dates:
         st.subheader("Normalize Date Formats")
 
         df = st.session_state.df
-        likely_date_cols = [col for col in df.columns
-                            if (df[col].dtype == 'object') or pd.api.types.is_datetime64_any_dtype(df[col].dtype)]
+
+        # --- DIT IS DE VERBETERDE LOGICA ---
+        # We definiëren een patroon dat zoekt naar datum-achtige structuren (bv. YYYY-MM-DD of DD/MM/YYYY)
+        date_pattern = r'\d{1,4}[-/]\d{1,2}[-/]\d{1,4}'
+
+        # We selecteren nu alleen kolommen die al een datumtype zijn, OF die tekstkolommen zijn
+        # en ten minste één waarde bevatten die overeenkomt met ons datum-patroon.
+        likely_date_cols = [
+            col for col in df.columns if
+            pd.api.types.is_datetime64_any_dtype(df[col].dtype) or
+            (df[col].dtype == 'object' and df[col].astype(str).str.contains(date_pattern, na=False).any())
+        ]
+        # --- EINDE VERBETERING ---
 
         if not likely_date_cols:
             st.info("No columns suitable for date normalization were found.")
         else:
             col1, col2 = st.columns(2)
             with col1:
-                default_dates = [c for c in likely_date_cols
-                                 if pd.api.types.is_datetime64_any_dtype(df[c].dtype) or 'date' in c.lower()]
-                selected_cols = st.multiselect("Columns to normalize:",
-                                               options=likely_date_cols,
-                                               default=default_dates,
-                                               help="Select the columns you want to convert to a standard date format.")
-            with col2:
-                target_format = st.text_input("Target Format:", value="%Y-%m-%d",
-                                              help="Use strftime codes. Common: %Y-%m-%d or %d-%m-%Y.")
+                # De gebruiker ziet nu alleen de relevante kolommen.
+                selected_cols = st.multiselect(
+                    "Columns to normalize:",
+                    options=likely_date_cols,
+                    default=likely_date_cols,  # Standaard alle gevonden datumkolommen selecteren
+                    help="Select the columns you want to convert to a standard date format."
+                )
 
-            if st.button("Normalize Selected Dates", key="normalize_dates_btn", use_container_width=True, type="primary"):
+            with col2:
+                target_format = st.text_input(
+                    "Target Format:",
+                    value="%Y-%m-%d",
+                    help="Use standard Python strftime codes. Common is %Y-%m-%d or %d-%m-%Y."
+                )
+
+            if st.button("Normalize Selected Dates", key="normalize_dates_btn", use_container_width=True,
+                         type="primary"):
                 if not selected_cols:
                     st.warning("Please select at least one column to normalize.")
                 elif not target_format:
@@ -401,7 +442,7 @@ def render_manual_cleaning_interface() -> None:
                 else:
                     _apply_manual_cleaning_action(
                         "normalize_dates",
-                        normalize_dates,
+                        normalize_dates,  # De functie uit manual_utils
                         st.session_state.df,
                         "Normalize Dates",
                         columns_to_process=selected_cols,
@@ -448,6 +489,55 @@ def render_manual_cleaning_interface() -> None:
                     st.error(f"Failed to rename columns: {e}")
                     st.session_state.df = original_df_copy  # Restore on failure
 
+    with tab_currency:
+        st.subheader("Currency Conversion")
+
+        # --- FIX: Read the key from os.getenv instead of st.secrets ---
+        api_key = os.getenv("EXCHANGERATE_API_KEY")
+
+        if not api_key:
+            # Show a helpful error message if the key is not in the .env file
+            st.error(
+                "ExchangeRate API key not found. Please ensure it is set as EXCHANGERATE_API_KEY in your .env file.")
+            st.stop()
+
+        df = st.session_state.df
+        # Find columns that likely contain currency
+        likely_currency_cols = [col for col in df.columns if
+                                df[col].astype(str).str.contains(r'[€$]|EUR|SRD', na=False).any()]
+
+        if not likely_currency_cols:
+            st.info("No columns with recognizable currency symbols (€, $, EUR, SRD) were found.")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                selected_cols = st.multiselect(
+                    "Columns to convert:",
+                    options=likely_currency_cols,
+                    default=likely_currency_cols,
+                    help="Select columns containing currency values you want to standardize."
+                )
+            with col2:
+                target_currency = st.selectbox(
+                    "Convert to:",
+                    options=["USD", "EUR", "SRD"],
+                    help="Select the target currency for the conversion."
+                )
+
+            if st.button("Convert Currencies", key="convert_currency_btn", use_container_width=True, type="primary"):
+                if not selected_cols:
+                    st.warning("Please select at least one column to convert.")
+                else:
+                    _apply_manual_cleaning_action(
+                        "convert_currency",
+                        convert_currency,  # The new function from manual_utils
+                        st.session_state.df,
+                        "Convert Currencies",
+                        # Parameters for the backend function:
+                        columns_to_process=selected_cols,
+                        target_currency=target_currency,
+                        api_key=api_key
+                    )
 # ==================================
 # MAIN PAGE LAYOUT
 # ==================================

@@ -5,7 +5,9 @@ from typing import Tuple, Dict, Union, Optional, List, Any
 from dataclasses import dataclass, field
 from datetime import datetime
 import traceback
-
+import requests
+import streamlit as st
+import pycountry
 
 @dataclass
 class CleaningSummary:
@@ -23,52 +25,135 @@ class CleaningSummary:
 # ============================================================================
 # VERNIEUWDE analyze_dataset FUNCTIE
 # ============================================================================
+# --- NIEUWE HELPERFUNCTIE 1: Namen correct formatteren ---
+def to_proper_case(name: str) -> str:
+    """Converts a string to proper title case, handling edge cases like 'Mac Intosh'."""
+    if not isinstance(name, str):
+        return name
+
+    # Een lijst van tussenvoegsels die klein moeten blijven (kan uitgebreid worden)
+    lower_case_words = ['van', 'de', 'der', 'den', 'ten', 'ter', 'te']
+
+    parts = name.strip().lower().split()
+    capitalized_parts = []
+    for part in parts:
+        if part in lower_case_words:
+            capitalized_parts.append(part)
+        else:
+            # Herkent "Mac" en "Mc" en zet de volgende letter in een hoofdletter
+            if part.startswith(('mc', 'mac')):
+                if len(part) > 2 and part[2].isalpha():
+                    part = part[:2] + part[2].upper() + part[3:]
+            capitalized_parts.append(part.capitalize())
+
+    return ' '.join(capitalized_parts)
+
+
+# --- NIEUWE HELPERFUNCTIE 2: Landcodes uitbreiden ---
+def expand_country_code(code: str) -> str:
+    """Converts a 2 or 3-letter country code to its full name."""
+    if not isinstance(code, str) or len(code.strip()) > 3:
+        return code  # Geef de originele waarde terug als het geen code is
+
+    try:
+        country = pycountry.countries.get(alpha_2=code.strip().upper())
+        if country:
+            return country.name
+    except Exception:
+        pass  # Ga door naar de volgende poging
+
+    try:
+        country = pycountry.countries.get(alpha_3=code.strip().upper())
+        if country:
+            return country.name
+    except Exception:
+        pass
+
+    return code  # Geef de originele waarde terug als niets is gevonden
+
+
 def analyze_dataset(df: pd.DataFrame) -> dict:
     """
-    Voert een uitgebreide, Pandas-compatibele analyse uit op de dataset.
+    Voert een geavanceerde analyse uit die is afgestemd op de schoonmaaktools.
     """
     if not isinstance(df, pd.DataFrame) or df.empty:
         return {'error': 'Dataset is invalid or empty.'}
-    try:
-        df_analysis = df.copy()
-        default_placeholders = ["", " ", "N/A", "NA", "NONE", "NULL", "Null", "-", "?", "onbekend", "MISSING", "nan",
-                                "<NA>"]
 
-        # Stap 1: Analyseer Missende Waarden (Robuust en Compatibel)
-        for col in df_analysis.select_dtypes(include=['object', 'string']).columns:
-            temp_col_as_str = df_analysis[col].astype(str)
-            placeholders_lower = [str(p).lower() for p in default_placeholders if str(p).strip()]
-            mask = temp_col_as_str.str.lower().str.strip().isin(placeholders_lower)
-            df_analysis.loc[mask, col] = np.nan
+    # Initialiseer de hoofdstructuur van de analyse
+    analysis = {
+        'shape': df.shape,
+        'duplicates_found': int(df.duplicated().sum()),
+        'missing_values_total': int(df.isnull().sum().sum()),
+        'missing_values_by_column': df.isnull().sum()[df.isnull().sum() > 0].to_dict(),
+        'column_analysis': {}
+    }
 
-        missing_info = {'total': int(df_analysis.isnull().sum().sum()),
-                        'by_column': df_analysis.isnull().sum().to_dict()}
+    # Helperfuncties voor detectie binnen de analyse
+    def _has_mixed_currencies(series: pd.Series) -> bool:
+        if series.dtype != 'object' or series.isnull().all(): return False
+        series_str = series.dropna().astype(str)
+        found_symbols = set(re.findall(r'([€$]|EUR|USD|SRD)', ' '.join(series_str), re.IGNORECASE))
+        return len(found_symbols) > 1
 
-        # Stap 2: Analyseer Datatypes & Tekst Standaardisatie
-        data_type_issues = []
-        text_standardization_issues = []
-        for col in df.columns:
-            series = df[col]
-            if series.dtype == 'object' and series.notna().any():
-                numeric_series = pd.to_numeric(series, errors='coerce')
-                if numeric_series.notna().sum() / len(series.dropna()) > 0.7:
-                    data_type_issues.append(f"Column '{col}' seems to contain numbers but is stored as text.")
-            if pd.api.types.is_string_dtype(series.dtype) or series.dtype == 'object':
-                non_null_series = series.dropna().astype(str)
-                if len(non_null_series) > 1:
-                    if non_null_series.str.strip().ne(non_null_series).any():
-                        text_standardization_issues.append(f"Column '{col}' has values with extra whitespace.")
-                    if non_null_series.nunique() > non_null_series.str.lower().nunique():
-                        text_standardization_issues.append(f"Column '{col}' has inconsistent casing.")
+    def _is_country_code_col(series: pd.Series) -> bool:
+        if series.dtype != 'object' or series.isnull().all(): return False
+        sample = series.dropna().unique()
+        short_text_sample = [s for s in sample if isinstance(s, str) and 2 <= len(s.strip()) <= 3 and s.isalpha()]
+        if len(short_text_sample) < 3: return False
+        valid_codes = 0
+        for code in short_text_sample[:20]:
+            try:
+                if pycountry.countries.get(alpha_2=code.strip().upper()) or pycountry.countries.get(
+                        alpha_3=code.strip().upper()):
+                    valid_codes += 1
+            except Exception:
+                continue
+        return (valid_codes / len(short_text_sample[:20])) > 0.5
 
-        return {
-            'shape': df.shape, 'duplicates': {'count': int(df.duplicated().sum())},
-            'missing': missing_info, 'data_type_issues': data_type_issues,
-            'text_standardization_issues': text_standardization_issues
-        }
-    except Exception as e:
-        print(f"Error in analyze_dataset: {e}\n{traceback.format_exc()}")
-        return {'error': f'Analysis failed: {str(e)}'}
+    # Loop door elke kolom voor een gedetailleerd rapport
+    for col in df.columns:
+        series = df[col]
+        col_report = {}
+
+        # Basis-checks (whitespace, casing, etc.)
+        if series.dtype == 'object':
+            non_null_series = series.dropna().astype(str)
+            if non_null_series.str.strip().ne(non_null_series).any():
+                col_report['whitespace_issue'] = True
+            if non_null_series.nunique() > non_null_series.str.lower().nunique():
+                col_report['casing_issue'] = True
+
+        # Potentiële datatype conversie check
+        if series.dtype == 'object' and pd.to_numeric(series,
+                                                      errors='coerce').notna().sum() / series.notna().count() > 0.7:
+            col_report['potential_type_conversion'] = "Numeric (stored as text)"
+
+        # --- NIEUWE, SLIMME DETECTIES ---
+        # 1. Detectie van Datumkolommen
+        try:
+            if series.dtype == 'object' and pd.to_datetime(series, errors='coerce',
+                                                           infer_datetime_format=True).notna().sum() / series.notna().count() > 0.6:
+                col_report['potential_date_column'] = True
+        except Exception:
+            pass
+
+        # 2. Detectie van Valutakolommen
+        if _has_mixed_currencies(series):
+            col_report['mixed_currency_issue'] = True
+
+        # 3. Detectie van Landcodekolommen
+        if _is_country_code_col(series):
+            col_report['potential_country_code_column'] = True
+
+        # 4. Detectie van Naamkolommen (voor Proper Case functie)
+        if _is_name_column(col, series):
+            col_report['potential_name_column'] = True
+
+        if col_report:
+            analysis['column_analysis'][col] = col_report
+
+    return analysis
+
 
 def remove_duplicates(
         df: pd.DataFrame,
@@ -201,6 +286,7 @@ def clean_data_types(df: pd.DataFrame) -> Tuple[pd.DataFrame, CleaningSummary, O
     summary.details['conversions_made'] = conversion_details
     return df_cleaned, summary, None
 
+
 def standardize_values(
         df: pd.DataFrame,
         target_columns: Optional[List[str]] = None,
@@ -208,47 +294,58 @@ def standardize_values(
         text_to_uppercase: bool = False,
         strip_whitespace_all: bool = True,
         remove_chars_regex: Optional[str] = None,
-        replace_chars_with: str = ''
+        replace_chars_with: str = '',
+        # --- DE FIX: Voeg de nieuwe parameters toe aan de functiedefinitie ---
+        apply_proper_case: bool = False,
+        expand_countries: bool = False
 ) -> Tuple[pd.DataFrame, CleaningSummary, Optional[pd.DataFrame]]:
     summary = CleaningSummary(original_shape=df.shape, action_taken="Standardize Values")
-    if df.empty:
-        summary.new_shape = df.shape
-        return df.copy(), summary, None
-
     df_cleaned = df.copy()
-    cols_to_process = target_columns if target_columns else df_cleaned.select_dtypes(
-        include=['object', 'string']).columns
+
+    if not target_columns:
+        cols_to_process = df_cleaned.select_dtypes(include=['object', 'string']).columns
+    else:
+        cols_to_process = target_columns
 
     modified_cols_count = 0
     for col_name in cols_to_process:
         if col_name in df_cleaned.columns:
             original_series = df_cleaned[col_name].copy()
-            # Convert to string type to use .str accessor safely
             current_col = df_cleaned[col_name].astype(pd.StringDtype())
 
-            if strip_whitespace_all: current_col = current_col.str.strip()
+            if strip_whitespace_all:
+                current_col = current_col.str.strip()
+
             if text_to_lowercase:
                 current_col = current_col.str.lower()
             elif text_to_uppercase:
                 current_col = current_col.str.upper()
 
-            # This part handles the new UI options "Remove punctuation" and "Remove digits"
+            # --- NIEUWE LOGICA: Voer de 'proper case' functie uit ---
+            if apply_proper_case:
+                # We gebruiken .apply() om de to_proper_case helperfunctie op elke waarde toe te passen
+                current_col = current_col.apply(lambda x: to_proper_case(x) if pd.notna(x) else x)
+
+            # --- NIEUWE LOGICA: Voer de landcode-expansie uit ---
+            if expand_countries:
+                current_col = current_col.apply(lambda x: expand_country_code(x) if pd.notna(x) else x)
+
             if remove_chars_regex:
                 current_col = current_col.str.replace(remove_chars_regex, replace_chars_with, regex=True)
 
-            # Only count as modified if the series has actually changed
             if not original_series.equals(current_col):
                 df_cleaned[col_name] = current_col
                 modified_cols_count += 1
 
     summary.columns_standardized = modified_cols_count
-    summary.rows_affected = modified_cols_count  # Simplification, can be improved
-    summary.new_shape = df_cleaned.shape
+    summary.rows_affected = df_cleaned.shape[0]  # Actie kan elke rij beïnvloeden
     summary.details = {
         'columns_processed': target_columns,
         'lowercase': text_to_lowercase,
         'uppercase': text_to_uppercase,
         'strip_whitespace': strip_whitespace_all,
+        'formatted_proper_names': apply_proper_case,
+        'expanded_country_codes': expand_countries,
         'removed_chars_pattern': remove_chars_regex
     }
     return df_cleaned, summary, None
@@ -387,3 +484,100 @@ def _convert_dates(series: pd.Series, target_format_strftime: str) -> pd.Series:
     except Exception as e:
         print(f"Warning (manual_utils._convert_dates): Could not format date series: {e}")
         return series
+
+
+# --- NEW: Helper function to get exchange rates with caching ---
+@st.cache_data(ttl=3600)  # Cache the results for 1 hour (3600 seconds)
+def get_exchange_rates(api_key: str, base_currency: str = "EUR") -> Dict[str, float]:
+    """Fetches latest exchange rates from the API and caches them."""
+    url = f"https://v6.exchangerate-api.com/v6/{api_key}/latest/{base_currency}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        data = response.json()
+        if data.get("result") == "success":
+            print(f"INFO: Successfully fetched exchange rates with base {base_currency}.")
+            return data["conversion_rates"]
+        else:
+            print(f"ERROR: API call was not successful. Response: {data}")
+            return {}
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: Could not fetch exchange rates: {e}")
+        return {}
+
+
+# --- NEW: Main currency conversion function ---
+def convert_currency(
+        df: pd.DataFrame,
+        columns_to_process: List[str],
+        target_currency: str,
+        api_key: str
+) -> Tuple[pd.DataFrame, CleaningSummary, Optional[pd.DataFrame]]:
+    summary = CleaningSummary(original_shape=df.shape, action_taken=f"Convert Currency to {target_currency}")
+    df_cleaned = df.copy()
+
+    if not columns_to_process:
+        raise ValueError("Please provide at least one column to process.")
+
+    # --- Step 1: Get exchange rates ---
+    # We use EUR as a stable base to convert from, then to the target.
+    rates = get_exchange_rates(api_key, "EUR")
+    if not rates:
+        st.error("Could not retrieve live exchange rates. Please check your API key and internet connection.")
+        return df, summary, None
+
+    target_rate = rates.get(target_currency.upper())
+    if not target_rate:
+        st.error(f"Target currency '{target_currency}' not found in exchange rates.")
+        return df, summary, None
+
+    # --- Step 2: Define currency mappings and regex ---
+    currency_map = {
+        '€': 'EUR', 'EUR': 'EUR',
+        '$': 'USD', 'USD': 'USD',
+        'SRD': 'SRD'
+    }
+    # This regex captures currency symbols and the numeric value
+    currency_pattern = re.compile(r'([€$]|EUR|USD|SRD)?\s*([\d,.-]+)')
+
+    rows_affected = 0
+    for col in columns_to_process:
+        if col in df_cleaned.columns:
+            original_series = df_cleaned[col].copy()
+
+            def converter(value):
+                if not isinstance(value, str):
+                    return value  # Return non-strings as is
+
+                match = currency_pattern.search(value)
+                if not match:
+                    return np.nan  # Not a recognizable currency format
+
+                symbol, number_str = match.groups()
+                source_currency = currency_map.get(symbol, 'EUR')  # Default to EUR if no symbol found
+
+                try:
+                    # Clean the number string
+                    cleaned_number_str = number_str.replace('.', '', number_str.count('.') - 1).replace(',',
+                                                                                                        '.').strip()
+                    amount = float(cleaned_number_str)
+                except (ValueError, TypeError):
+                    return np.nan
+
+                # Convert amount to EUR first, then to target currency
+                amount_in_eur = amount / rates.get(source_currency, 1.0)
+                converted_amount = amount_in_eur * target_rate
+                return round(converted_amount, 2)
+
+            df_cleaned[col] = df_cleaned[col].apply(converter)
+            rows_affected += (original_series != df_cleaned[col]).sum()
+
+    summary.new_shape = df_cleaned.shape
+    summary.rows_affected = int(rows_affected)
+    summary.details = {
+        'columns_processed': columns_to_process,
+        'target_currency': target_currency,
+        'base_currency_for_rates': 'EUR'
+    }
+
+    return df_cleaned, summary, None
